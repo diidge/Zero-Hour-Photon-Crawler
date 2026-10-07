@@ -6,8 +6,7 @@ Logs in to the game's servers the way the game does (with the Steam ticket of a 
 Zero Hour), then loops: look at a region's room list, join a competitive match that is already in its later
 rounds, stay quietly until the match ends, record every player's kills, deaths, damage, score, team and
 win/loss, leave, and move on. Each finished match is saved in the "matches" folder and, if an upload address
-and key are set, sent to the bot. It moves nothing and takes no game actions, other than optionally announcing
-itself in room chat on join/leave (see JOIN/LEAVE CHAT ANNOUNCEMENT below).
+and key are set, sent to the bot. It sends no chat, moves nothing and takes no game actions.
 
 ONE-TIME SET UP
 1. Install the .NET 8 SDK (free, from Microsoft).
@@ -54,22 +53,41 @@ GAME MODES (confirmed by M7)
  Co-op is a separate "Match Type" (BlockedMatchTypes keeps it out). Only mode 2 (TDM/Bomb) has been checked so far;
  in the log, the CHECK lines show whether TDM and TDM/Hostage matches are read correctly too.
 
-JOIN/LEAVE CHAT ANNOUNCEMENT (real feature)
- Set "JoinChatMessage" and/or "LeaveChatMessage" in config.json to have the crawler say something in room chat
- shortly after joining and/or right before leaving. Leave either blank to skip that announcement. The message
- fades after "ChatMessageDisplaySeconds" (default 8). "LeaveMessageDelaySeconds" (default 3) controls how long
- the crawler stays connected after sending the leave message before it actually leaves the room - needed because
- leaving instantly destroys everything the crawler owns, including the chat bubble.
+CAPTURING A CHAT MESSAGE (for the chat-sending investigation)
+ Set "CaptureUnknownEvents": true in config.json. With this on, the crawler fully logs every event code it
+ doesn't already understand to chat_capture.log, every time one happens - no truncation, no "first 2 only" limit.
+ Your own events are logged in full; anything from another real player is logged as code/size/sender only, never
+ their actual message, so a capture session never ends up holding someone else's chat text.
+ To use it:
+   1. Set CaptureUnknownEvents to true. Also set CaptureTrustedPlayer to your own in-game display name, exactly as
+      it appears in the room (case doesn't matter) - this is the one account allowed to have its own content shown
+      in full, since the crawler's own actor never sends chat itself. Leave it blank for anyone else: everyone
+      else's content stays redacted no matter what.
+   2. Start the crawler and join a room - ideally a private, near-empty one, though it still works, with everyone
+      but you protected, in a populated room if that is what is available.
+   3. From YOUR OWN account (the one named in CaptureTrustedPlayer), send ONE deliberate test chat message,
+      something recognisable like "testmsg12345".
+   4. Stop the crawler, set CaptureUnknownEvents and CaptureTrustedPlayer back to false/blank, and look at
+      chat_capture.log for a line tagged "[trusted test account]" around when you sent it. Send Claude that file
+      (or the relevant lines from it).
+ Turn this back off afterwards - it's a diagnostic tool for this one investigation, not something to leave on.
 
-DIAGNOSTIC TOOLS (for investigating new protocol details, e.g. after a game update changes something)
- These are all off/blank by default and should stay that way for normal runs.
- - "CaptureUnknownEvents": true logs every event code the crawler doesn't already understand, in full, to
-   chat_capture.log. Other real players' content is never recorded (code/size/sender only); only the crawler's
-   own events, or the one display name in "CaptureTrustedPlayer" (case-insensitive), are logged unredacted.
-   Use this briefly in a private test room with one deliberate test message, then turn it back off.
- - "SendTestChatMessage": "<text>" sends that text as a one-off chat message a few seconds after joining, using
-   the same mechanism as the real JoinChatMessage/LeaveChatMessage feature. Useful for testing a chat-sending
-   change in isolation without running a full join/leave cycle. Test in an empty or private room first.
+SENDING A TEST CHAT MESSAGE (experimental - the crawler's first attempt at actively sending traffic, not just
+reading it)
+ Set "SendTestChatMessage" in config.json to the exact text you want sent, e.g. "stbtest12345". Leave it blank
+ otherwise - this is off by default and should only be turned on for a deliberate test.
+ What it does: about 4 seconds after joining a room, it sends that text as a chat message ONCE, using our best
+ reconstruction of what a real chat message looks like on the wire (one INSTANTIATE for a "ChatFeed_Prefab" view,
+ then an RPC index 197 "ShowChatFeed" call on it, with args [3, <our actor's IDLogger-style view id>, "<text>"]).
+ The "3" is copied unchanged from what a real client sent in testing; its exact meaning (possibly a chat-channel
+ flag) is not confirmed. The view-id scheme is also inferred from observation, not from the SDK's own allocation
+ rules, so it may not be entirely correct.
+ IMPORTANT: test this in an empty or private room first, never in a live match with real players, until you have
+ confirmed it behaves correctly. Watch the console for a "TEST CHAT SENT" line, then check - from a SEPARATE real
+ game client sitting in the same room - whether the message actually appeared, and whether it looked right (right
+ text, no visual glitch, nothing else unexpected). If anything looks wrong, Ctrl+C immediately and send Claude the
+ console output and what you saw in-game.
+ Turn this back off (blank) after testing. It only ever sends once per run, but there is no reason to leave it set.
 
 AFTER A GAME UPDATE
  The game sends each message as a short number: its place in an alphabetical list of the game's multiplayer functions.

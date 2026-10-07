@@ -1,14 +1,11 @@
-// Zero Hour Photon client - lobby scanner, "room peek", and match-recording crawler.
+// Zero Hour Photon client - lobby scanner and "room peek".
 //
 //  * Scan mode (ScanAllRegions = true): visits every region and lists the rooms in each lobby.
-//  * Join mode (JoinRoom.Name/Match set in config.json): joins ONE room as an ordinary player, sits there
-//    writing down what the server sends (players, properties, events), then leaves after StaySeconds.
-//    Press Ctrl+C at any time to make it leave right away.
-//  * Crawl mode (Crawl.Enabled = true, overrides the above): autonomously visits competitive matches
-//    already near their end, records the result, and moves on. See RunCrawler().
+//  * Join mode (JoinRoom.Name set in config.json): joins ONE named room as an ordinary player, does nothing
+//    but sit there and write down what the server sends (players, their properties, and the game's events),
+//    then leaves by itself after StaySeconds. Press Ctrl+C at any time to make it leave right away.
 //
-// It never moves and takes no game actions beyond joining/leaving rooms. It can optionally announce itself
-// in room chat on join/leave (JoinChatMessage/LeaveChatMessage below) - that is the one exception to "silent".
+// It never chats, never moves, never sends any game actions.
 
 using System;
 using System.Collections;
@@ -88,27 +85,28 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
     private static bool scanning;
     private static volatile bool stopRequested;
     private static bool onlyCompetitive;
-
-    // Chat announcement feature (real, shipped): say something in room chat on join and/or just before leaving.
-    private static string joinChatMessage = "";
-    private static string leaveChatMessage = "";
-    private static int leaveMessageDelaySeconds = 3;  // how long we wait, still connected, after sending the leave message
-
-    // Diagnostic-only fields, all off/blank by default. Safe to leave in config.json as "" / false for every
-    // normal run; only turn these on deliberately, for a short session, when investigating a new protocol detail.
-    private static bool captureUnknownEvents;    // see CaptureUnknownEvents note on HandleInstantiate/CaptureEvent
-    private static string captureTrustedPlayer = "";  // see CaptureEvent
-    private static string sendTestChatMessage = "";   // see MaybeSendTestChatMessage
+    private static bool captureUnknownEvents;  // see the CaptureUnknownEvents note above
+    private static string captureTrustedPlayer = "";  // see CaptureTrustedPlayer below
+    private static string sendTestChatMessage = "";  // see SendTestChatMessage below
+    private static string joinChatMessage = "";  // real feature: announced in room chat shortly after joining
+    private static string leaveChatMessage = "";  // real feature: announced in room chat right before leaving
+    private static int leaveMessageDelaySeconds = 3;  // how long we wait, still connected, after sending it
 
     private static readonly HashSet<int> allowedModes = new HashSet<int>();
     private static readonly HashSet<int> blockedTypes = new HashSet<int>();
     public bool Refused;   // found the room, but it is not the kind of match we are allowed to join
 
     // ---------------------------------------------------------------------------------------------------------
-    // A real IDLogger INSTANTIATE carries a field (type code 86, 12 bytes = 3 big-endian floats) that is the
-    // player's spawn-position Vector3. Our logger object has no real position, so we register the same custom
-    // type code and always send (0,0,0) - what matters is that the field is PRESENT and correctly typed, not
-    // its value.
+    // A real IDLogger INSTANTIATE (captured from Saitama's own client, 10/6 ~8:49pm) carried one field our raw
+    // Photon client can't decode on its own:
+    //   key 1 = UnknownType{TypeCode=86, Size=12, Data=bytes(12) C3-E9-5C-F7-42-06-0D-DC-C3-BC-11-63}
+    // Size 12 with type code 86 is a game-registered custom type - almost certainly a Vector3 (3 floats), the
+    // spawn position. Decoding those 12 bytes as three BIG-ENDIAN floats gives roughly (-466, 33.5, -23.5),
+    // which is a plausible map coordinate (small, sane magnitudes); little-endian gives nonsense magnitudes,
+    // so this confirms big-endian, matching Photon's usual network byte order for custom types.
+    // We don't need the position to be meaningful (the crawler has no real avatar, just a logger object), so
+    // we register this same type code and send (0,0,0) - what matters is that the field is PRESENT and of the
+    // correct registered type, not its value.
     struct Vec3 { public float X, Y, Z; }
     const byte Vec3TypeCode = 86;
     static bool vec3Registered;
@@ -131,9 +129,11 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
     static object DeserializeVec3(byte[] bytes) =>
         new Vec3 { X = ReadFloatBE(bytes, 0), Y = ReadFloatBE(bytes, 4), Z = ReadFloatBE(bytes, 8) };
 
-    // Registers our Vec3 stand-in under the real game's Vector3 custom type code (86) so Photon can serialize
-    // it correctly on the wire. If this doesn't compile against your installed Photon package version, the
-    // error will show the real PhotonPeer.RegisterType signature it expects.
+    // Registers our Vec3 stand-in under the same custom type code (86) the real game uses for a Vector3, so we
+    // can put one in an Instantiate payload and Photon will serialize it correctly on the wire. If the exact
+    // method/delegate names here don't match your installed Photon package version, the compiler error will
+    // show the real signature it expects (ExitGames.Client.Photon.PhotonPeer.RegisterType) - this is written
+    // against the common byte[]-based SerializeMethod/DeserializeMethod overload.
     static void RegisterVec3CustomType()
     {
         if (vec3Registered) return;
@@ -167,20 +167,27 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
         }
         if (cfg.TryGetProperty("ScoreboardSeconds", out var bs)) boardSeconds = bs.GetInt32();
         if (cfg.TryGetProperty("OnlyCompetitive", out var oc)) onlyCompetitive = oc.GetBoolean();
-        // DIAGNOSTIC ONLY, off by default: logs every event code the crawler doesn't already understand, in
-        // full, to chat_capture.log. Other real players' content is never recorded (code/size/sender only) -
-        // only our own events, or the one trusted account below, are logged in full. See HandleInstantiate/
-        // CaptureEvent. Use briefly in a private test room, then turn back off.
+        // DIAGNOSTIC ONLY - for the chat-sending investigation. Off by default. When on, every event whose code
+        // isn't one the crawler already understands (200/201/202/204/206) gets fully logged to chat_capture.log,
+        // every time it happens, with no truncation and no "first 2 only" limit. Full payload content is only ever
+        // written for events the crawler itself SENDS or that come from its own actor - anything
+        // from another real player is logged as code/size/sender only, never their message content. Use this in a
+        // short, private, near-empty room (just you and the crawler) with one deliberate test message, not in a
+        // real match: run it, look at chat_capture.log, then turn it back off.
         if (cfg.TryGetProperty("CaptureUnknownEvents", out var cue)) captureUnknownEvents = cue.GetBoolean();
-        // The one display name (case-insensitive) allowed to have its own captured content shown unredacted
-        // during a CaptureUnknownEvents test, since the crawler itself never sends chat on its own. Leave blank
-        // outside of a deliberate, consented test.
+        // The one account allowed to have its own captured content shown in full (a display name, matched without
+        // regard to case) - normally the crawler's own actor is the only one unredacted, but the crawler itself
+        // never sends chat, so a real test needs YOUR account named here instead. Leave blank except during a
+        // deliberate, consented test.
         if (cfg.TryGetProperty("CaptureTrustedPlayer", out var ctp)) captureTrustedPlayer = (ctp.GetString() ?? "").Trim();
-        // DIAGNOSTIC ONLY, off by default: if set, sends this exact text as a one-off test chat message a few
-        // seconds after joining. Superseded by the real JoinChatMessage/LeaveChatMessage feature below; kept
-        // only as a quick way to test chat-sending changes in isolation. Leave blank otherwise.
+        // EXPERIMENTAL, for the chat-sending investigation only. If set, the crawler sends this exact text as a
+        // chat message ONCE, a few seconds after joining a room, then never again. This is the crawler's first
+        // attempt at actively sending game traffic rather than only observing it - the Instantiate and RPC shape
+        // below is our best reconstruction from a captured real message, not confirmed safe or correct. Test it
+        // in an empty or private room first, not a live match with real players. Leave blank otherwise.
         if (cfg.TryGetProperty("SendTestChatMessage", out var stc)) sendTestChatMessage = (stc.GetString() ?? "").Trim();
-        // Real feature: announce in room chat on join and again right before leaving. Leave either blank to skip.
+        // The real feature: announce in room chat when we join and again right before we leave. Confirmed
+        // working 10/6 ~8:55pm (see SendChatMessage). Leave either blank to skip that announcement.
         if (cfg.TryGetProperty("JoinChatMessage", out var jcm)) joinChatMessage = (jcm.GetString() ?? "").Trim();
         if (cfg.TryGetProperty("LeaveChatMessage", out var lcm)) leaveChatMessage = (lcm.GetString() ?? "").Trim();
         if (cfg.TryGetProperty("ChatMessageDisplaySeconds", out var cds)) chatDisplaySeconds = cds.GetInt32();
@@ -314,9 +321,12 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
             if (leaveChatMessage.Length > 0)
             {
                 SendChatMessage(leaveChatMessage, "leave");
-                // Stay connected a bit longer before actually leaving: Photon auto-destroys everything we own
-                // (including the chat view) the instant we leave the room, so the message needs this wait to
-                // be visible at all. LeaveMessageDelaySeconds in config.json controls how long.
+                // Stay connected a bit longer before actually leaving. The first attempt at this used a fixed
+                // ~0.9s wait and the message vanished almost immediately - most likely because leaving the room
+                // makes Photon auto-destroy everything we own (including this chat view), the same generic
+                // Destroy op as DestroyView() above, so the bubble disappeared the instant we disconnected
+                // rather than fading on its own timer. Waiting longer here, still connected, is what buys the
+                // message real visible time; LeaveMessageDelaySeconds in config.json controls how long.
                 for (int i = 0; i < leaveMessageDelaySeconds * 1000 / 30; i++) { client.Service(); Thread.Sleep(30); }
             }
             Log("leaving the room now.");
@@ -1139,8 +1149,10 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
         }
     }
 
-    // DIAGNOSTIC ONLY (see CaptureUnknownEvents above). Full detail for our own events, or the trusted test
-    // account's; any other real player's event is recorded as shape only (code, size, sender), never content.
+    // DIAGNOSTIC ONLY (see CaptureUnknownEvents above). Full detail for OUR OWN events (sent by us, or from our
+    // own actor), since we know our own message content and sending it is the whole point of this test. For any
+    // OTHER real player's event, only the shape (code, size, sender) is recorded - never their actual content -
+    // so a capture session never ends up holding someone else's private chat text.
     void CaptureEvent(EventData e, int code, int sender)
     {
         int myActor = client.LocalPlayer?.ActorNumber ?? -1;
@@ -1155,12 +1167,21 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
         CaptureLog($"CAPTURE event {code} ({EventName(code)}) from actor {sender}{tag}: {text}");
     }
 
+    // EXPERIMENTAL (see SendTestChatMessage above). Reconstructed from one captured real chat message:
+    //   INSTANTIATE "ChatFeed_Prefab" (code 202), then RPC index 197 "ShowChatFeed" (code 200) on that new view,
+    //   with args [3, <sender's own IDLogger view id>, "<message text>"]. The "3" was constant across 8 captured
+    //   test messages; its meaning is not confirmed (possibly a chat-channel flag), so we send it unchanged,
+    //   exactly as the real client did. The view id we instantiate under is self-picked within our own actor's
+    //   id block (actorNumber*1000 + a free offset) - Photon view ids followed that deterministic per-actor
+    //   scheme in everything we observed, with no sign of a separate server-side allocation handshake, but this
+    //   is inferred, not confirmed from the SDK source.
     // Instantiates a view shaped like the real game's IDLogger for our own actor, so a chat message's sender
-    // view id resolves to something real instead of falling back to template placeholder text. Shape taken
-    // from a real captured IDLogger INSTANTIATE:
-    //   {6=<verification hash>, 4=[v1,v2], 0="IDLogger", 1=<Vector3, custom type 86>, 7=v1}
-    // i.e. TWO view ids at once (4, the full list; 7, the primary one, redundant with 4[0]), a prefab name, the
-    // same kind of verification hash ChatFeed_Prefab needs (6), and a position (1, see the Vec3 note above).
+    // view id can resolve to something real instead of falling back to template placeholder text. Shape taken
+    // from a real captured IDLogger INSTANTIATE (actor 3, 10/6 ~8:49pm):
+    //   {6=-1156555751, 4=[3001,3002], 0="IDLogger", 1=<Vector3, custom type 86>, 7=3001}
+    // i.e. TWO view ids at once (4, the full list; 7, the first/primary one, redundant with 4[0]), a prefab
+    // name, the same kind of verification hash ChatFeed_Prefab needs (6), and a position (1) - see the Vec3
+    // note above for why (0,0,0) is fine here even though the real value was the player's actual spawn point.
     int ownIDLoggerView;   // 0 until InstantiateOwnIDLogger() has run
     void InstantiateOwnIDLogger()
     {
@@ -1183,8 +1204,10 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
         catch (Exception ex) { Log($"Instantiating our own IDLogger failed: {ex.Message}"); }
     }
 
-    // PUN's generic "Destroy" op (event code 204, one-field payload {0=viewId}). Used to make our own chat
-    // bubble fade away like a real one instead of sitting on screen forever.
+    // PUN's generic "Destroy" op (event code 204) - confirmed directly from zh_peek.log, not guessed: every
+    // real destroy we've ever logged (bullets, effects, etc. - thousands of them across past sessions) has the
+    // same one-field shape, e.g. "destroy from actor 9: {0=9351}". Used to make our own chat bubble fade away
+    // like a real one instead of sitting on screen forever, since we never otherwise signal it should go away.
     readonly List<System.Threading.Timer> pendingTimers = new List<System.Threading.Timer>();  // keep timers alive until they fire
     void DestroyView(int viewId, string why)
     {
@@ -1196,13 +1219,15 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
         catch (Exception ex) { Log($"Destroying view {viewId} ({why}) failed: {ex.Message}"); }
     }
 
-    // How long a chat bubble we sent stays up before we destroy its view ourselves. Adjust
-    // ChatMessageDisplaySeconds in config.json if it doesn't match how long a real message stays up.
+    // How long a chat bubble we sent stays up before we destroy its view ourselves. Not confirmed against a
+    // real message's own natural fade time - pick a value, watch how it compares to an ordinary player's
+    // message next time, and adjust ChatMessageDisplaySeconds in config.json if it's off.
     static int chatDisplaySeconds = 8;
 
-    // Sends one chat message as "us". Used for the real join/leave announcements as well as the diagnostic
-    // SendTestChatMessage field. A fresh chatView offset is used each call (chatMessageCount) so a join message
-    // and a later leave message don't reuse the same Photon view id.
+    // Sends one chat message as "us" - confirmed working 10/6 ~8:55pm (the "selfidtest321" test showed up
+    // correctly, name and text both, once InstantiateOwnIDLogger() had run first). Used for the real join/leave
+    // announcements as well as the ad-hoc SendTestChatMessage field. A fresh chatView offset is used each call
+    // (chatMessageCount) so a join message and a later leave message don't reuse the same Photon view id.
     int chatMessageCount;
     void SendChatMessage(string text, string why)
     {
@@ -1217,8 +1242,12 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
             int myLoggerView = ownIDLoggerView > 0 ? ownIDLoggerView : myActor * 1000 + 1;
             int chatView = myActor * 1000 + 500 + chatMessageCount++;   // a free, per-message offset in our own block
 
-            // Key 6 is a required verification-hash field (NetworkInstantiate null-checks it); not confirmed
-            // to need this exact value vs. just being present, but this is the one real value we've captured.
+            // Key 6 is the field that was missing before, confirmed from a real captured ChatFeed_Prefab
+            // instantiate: {6=165573598, 0="ChatFeed_Prefab", 7=1004}. NetworkInstantiate null-checks this
+            // field and that absence is what caused the NullReferenceException/error popup early on.
+            // This exact number is NOT confirmed to be a fixed constant - the same check on StarterLogger's
+            // own hash gave a different value in a different session - so this may only need to be PRESENT
+            // (any int) rather than match a specific expected value. Using the one real value we have seen.
             var instantiateData = new PhotonHashtable {
                 { (byte)0, "ChatFeed_Prefab" },              // prefab name
                 { (byte)6, 165573598 },                      // the field that was missing before - see note above
@@ -1254,22 +1283,27 @@ class Program : IConnectionCallbacks, ILobbyCallbacks, IMatchmakingCallbacks, II
     }
 
     // A game object was created. Remember its name by view id; objects with "Log" in the name are the ones to watch.
-    // capturedChatInstantiate/capturedIDLoggerInstantiate (below) are diagnostic one-shot captures, gated behind
-    // CaptureUnknownEvents: the Instantiate payload itself never carries message text (only prefab name, a
-    // verification hash, and view ids), so capturing one example of each in full is not a privacy concern the
-    // way chat content is - useful if a future game update changes either object's shape.
-    bool capturedChatInstantiate;
-    bool capturedIDLoggerInstantiate;
+    bool capturedChatInstantiate;  // see the full-payload note below - only need one real example, not every one
+    bool capturedIDLoggerInstantiate;  // same idea, for IDLogger - see the note below
     void HandleInstantiate(EventData e, int sender)
     {
         var h = e.CustomData as Hashtable;
         if (h == null) return;
         string prefab = h.ContainsKey((byte)0) ? Convert.ToString(h[(byte)0]) : "?";
+        // The Instantiate payload itself never carries message text (only prefab name, a verification hash, and
+        // view ids), so capturing it in full is not a privacy concern the way chat content is. We need ONE real
+        // example of a genuine ChatFeed_Prefab instantiate to see fields our own hand-built one is missing
+        // (SendTestChatMessage's send succeeded at the network level but produced no visible message - an
+        // incomplete Instantiate payload, missing something like a prefab hash, is the leading explanation).
         if (captureUnknownEvents && !capturedChatInstantiate && prefab.IndexOf("chat", StringComparison.OrdinalIgnoreCase) >= 0 && sender != (client.LocalPlayer?.ActorNumber ?? -1))
         {
             capturedChatInstantiate = true;
             CaptureLog($"FULL ChatFeed INSTANTIATE from actor {sender}: {Str(h)}");
         }
+        // Same idea, for IDLogger: it's the object a chat message's sender view id points back to, and we don't
+        // have one, which is the leading explanation for the sender/message resolving as template placeholder
+        // text in testing. IDLogger claims TWO view ids at once (unlike ChatFeed_Prefab's one), so its payload
+        // shape is likely different and we need a real example rather than guessing from ChatFeed_Prefab's.
         if (captureUnknownEvents && !capturedIDLoggerInstantiate && prefab.Equals("IDLogger", StringComparison.OrdinalIgnoreCase) && sender != (client.LocalPlayer?.ActorNumber ?? -1))
         {
             capturedIDLoggerInstantiate = true;
