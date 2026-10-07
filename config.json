@@ -1,0 +1,89 @@
+{
+  "AppId": "3c8fbf46-4e04-4155-92c1-1bf767b59459",
+  "AppVersion": "ZeroHour1.07_2.51",
+  "Server": "5.189.203.202",
+  "Endpoints": [
+    {
+      "Server": "216.120.180.20",
+      "Port": 5058,
+      "Protocol": "Udp",
+      "NameServer": true,
+      "Regions": [
+        "eu"
+      ]
+    }
+  ],
+  "ConnectSeconds": 25,
+  "RunSeconds": 60,
+  "NickName": "Rooftop Korean",
+  "UseSteam": true,
+  "ScanAllRegions": false,
+  "ScanSeconds": 8,
+  "JoinRoom": {
+    "Name": "",
+    "Match": "701-382-565",
+    "Region": "eu",
+    "StaySeconds": 1200
+  },
+  "OnlyCompetitive": true,
+  "AllowedGameModes": [
+    0,
+    1,
+    2
+  ],
+  "BlockedMatchTypes": [
+    4
+  ],
+  "ScoreboardSeconds": 30,
+  "Crawl": {
+    "Enabled": true,
+    "Regions": [
+      "eu",
+      "ru",
+      "rue",
+      "us",
+      "usw",
+      "cae",
+      "asia",
+      "jp",
+      "au",
+      "sa",
+      "in",
+      "kr",
+      "za",
+      "tr",
+      "uae",
+      "ussc",
+      "hk"
+    ],
+    "MinRound": 6,
+    "MinFreeSlots": 1,
+    "MaxStaySeconds": 600,
+    "ScanSeconds": 8,
+    "PauseBetweenSeconds": 10,
+    "MaxJoinsPerHour": 12,
+    "MaxHours": 4,
+    "UploadUrl": "",
+    "ApiKey": "",
+    "StopAfterIdleHours": 6,
+    "StopFile": "stop.txt",
+    "VerboseLog": false,
+    "ScoreboardSeconds": 120,
+    "PreferDirect": false,
+    "RpcNumbers": {
+      "BlueTeam": 23,
+      "RedTeam": 24,
+      "RoundScore": 27,
+      "SwapSides": 213,
+      "MatchResult": 199,
+      "NextMapVote": 243
+    }
+  },
+  "CaptureUnknownEvents": false,
+  "CaptureTrustedPlayer": "",
+  "SendTestChatMessage": "",
+  "JoinChatMessage": "Stat Tracking Bot Joined",
+  "LeaveChatMessage": "STB Disconnected - Results at zhsb.info",
+  "ChatMessageDisplaySeconds": 8,
+  "LeaveMessageDelaySeconds": 3
+}
